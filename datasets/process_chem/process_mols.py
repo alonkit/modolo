@@ -99,9 +99,9 @@ def moad_extract_receptor_structure(pdb, complex_graph, neighbor_cutoff=20, max_
 
 def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cutoff=20, max_neighbors=None, lm_embeddings=None,
                                    knn_only_graph=False, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None):
-    chi_angles, one_hot = get_chi_angles(all_coords, seq, return_onehot=True)
-    n_rel_pos, c_rel_pos = all_coords[:, 0, :] - all_coords[:, 1, :], all_coords[:, 2, :] - all_coords[:, 1, :]
-    sidechain_vecs = torch.from_numpy(np.concatenate([chi_angles / 360, n_rel_pos, c_rel_pos], axis=1))
+    # chi_angles, one_hot = get_chi_angles(all_coords, seq, return_onehot=True)
+    # n_rel_pos, c_rel_pos = all_coords[:, 0, :] - all_coords[:, 1, :], all_coords[:, 2, :] - all_coords[:, 1, :]
+    # sidechain_vecs = torch.from_numpy(np.concatenate([chi_angles / 360, n_rel_pos, c_rel_pos], axis=1))
 
     # Build the k-NN graph
     coords = torch.tensor(all_coords[:, 1, :], dtype=torch.float)
@@ -137,7 +137,7 @@ def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cuto
     lm_embeddings = torch.tensor(np.concatenate(lm_embeddings, axis=0)) if lm_embeddings is not None else None
     complex_graph['receptor'].x = torch.cat([node_feat, lm_embeddings], axis=1) if lm_embeddings is not None else node_feat
     complex_graph['receptor'].pos = coords
-    complex_graph['receptor'].sidechain_vecs = sidechain_vecs.float()
+    # complex_graph['receptor'].sidechain_vecs = sidechain_vecs.float()
     complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = edge_index
     if all_atoms:
         atom_coords = all_coords.reshape(-1, 3)
@@ -179,6 +179,92 @@ def new_extract_receptor_structure(seq, all_coords, complex_graph, neighbor_cuto
         complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
 
     return
+
+def get_sub_prot_for_ligs(
+    protein_graph, ligand_graphs, rec_cutoff_distance, atom_cutoff_distance=None
+):
+    all_atoms = atom_cutoff_distance is not None
+    lig_poses = torch.cat([g["ligand"].pos for g in ligand_graphs], dim=0)
+    lig_slices = torch.tensor([0, *(len(g["ligand"].pos) for g in ligand_graphs)])
+    lig_slices = torch.cumsum(lig_slices, dim=0)
+    lig_rec_batch = radius(
+        protein_graph["receptor"].pos,
+        lig_poses,
+        rec_cutoff_distance,
+        max_num_neighbors=9999,
+    )
+  
+    if all_atoms:
+        lig_atom_batch = radius(
+            protein_graph["atom"].pos,
+            lig_poses,
+            atom_cutoff_distance,
+            max_num_neighbors=9999,
+        )
+    lig_rec = None
+    rec_id = None
+    lig_atom = None
+    atom_id = None
+    rec_rec = None
+    atom_rec = None
+    atom_atom = None
+    sub_proteins = []
+    lig_rec_slices = torch.searchsorted(lig_rec_batch[0], lig_slices)
+    lig_atom_slices = (
+        torch.searchsorted(lig_atom_batch[0], lig_slices) if all_atoms else None
+    )
+    rec_rec_orig = protein_graph["receptor", "receptor"].edge_index
+    rec_rec_orig = rec_rec_orig[
+        :, torch.all(torch.isin(rec_rec_orig, lig_rec_batch[1]), dim=0)
+    ]
+    if all_atoms:
+        atom_atom_orig = protein_graph["atom", "atom"].edge_index
+        atom_atom_orig = atom_atom_orig[
+            :, torch.all(torch.isin(atom_atom_orig, lig_atom_batch[1]), dim=0)
+        ]
+        atom_rec_orig = protein_graph["atom", "receptor"].edge_index
+        atom_rec_orig_e = torch.isin(
+            atom_rec_orig[0], lig_atom_batch[1]
+        ) & torch.isin(atom_rec_orig[1], lig_rec_batch[1])
+        atom_rec_orig = atom_rec_orig[:, atom_rec_orig_e]
+    for i, lig_i_start in enumerate(lig_slices[:-1]):
+        rec_e_start, rec_e_end = lig_rec_slices[i : i + 2]
+        lig_rec = lig_rec_batch[:, rec_e_start:rec_e_end].clone()
+        if lig_rec.numel():
+            lig_rec[0] = lig_rec[0] - lig_i_start
+        if all_atoms:
+            atom_e_start, atom_e_end = lig_atom_slices[i : i + 2]
+            lig_atom = lig_atom_batch[:, atom_e_start:atom_e_end].clone()
+            if lig_atom.numel():
+                lig_atom[0] = lig_atom[0] - lig_i_start
+        # now we have all the edges to the full protein
+        rec_id = torch.unique(lig_rec[1])
+        if all_atoms:
+            atom_id = torch.unique(lig_atom[1])
+
+        rec_rec = rec_rec_orig[
+            :, torch.all(torch.isin(rec_rec_orig, rec_id), dim=0)
+        ]
+        rec_rec = torch.searchsorted(rec_id, rec_rec)
+        lig_rec[1] = torch.searchsorted(rec_id, lig_rec[1])
+
+        if all_atoms:
+            atom_atom = atom_atom_orig[
+                :, torch.all(torch.isin(atom_atom_orig, atom_id), dim=0)
+            ]
+            atom_atom = torch.searchsorted(atom_id, atom_atom)
+            lig_atom[1] = torch.searchsorted(atom_id, lig_atom[1])
+
+            relevant_edges = torch.isin(atom_rec_orig[0], atom_id) & torch.isin(
+                atom_rec_orig[1], rec_id
+            )
+            atom_rec = atom_rec_orig[:, relevant_edges]
+            atom_rec[0] = torch.searchsorted(atom_id, atom_rec[0])
+            atom_rec[1] = torch.searchsorted(rec_id, atom_rec[1])
+        sub_proteins.append(
+            (rec_id, lig_rec, rec_rec, atom_id, lig_atom, atom_atom, atom_rec)
+        )
+    return sub_proteins
 
 
 def get_moad_atom_feats(res, coords):

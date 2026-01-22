@@ -65,6 +65,8 @@ class CustomDistributedSampler(DistributedSampler):
             # remove tail of data to make it evenly divisible.
             indices = indices[:min(self.indices_len)]
 
+        bad = set(['A95216', 'A70694', 'A86475', 'A64763', 'A26624'])
+        indices = [x for x in indices if x[0] not in bad]  # TEMPORARY FIX FOR CORRUPTED DATA
         return iter(indices)
 
 
@@ -81,27 +83,32 @@ class CustomTaskDistributedSampler(CustomDistributedSampler):
         self.set_tasks()
         self.num_tasks = self.num_samples // self.task_size,
         
+        self.tasks_good = {}
+        self.tasks_bad = {}
+        
     
     def set_tasks(self):
-        tasks_good = defaultdict(list)
-        tasks_bad = defaultdict(list)
+        self.tasks_good = defaultdict(list)
+        self.tasks_bad = defaultdict(list)
         for task, idx in super().__iter__():
             if self.dataset.tasks[task]['labels'][idx] == 1:
-                tasks_good[task].append(idx)
+                self.tasks_good[task].append(idx)
             else:
-                tasks_bad[task].append(idx)
+                self.tasks_bad[task].append(idx)
         self.tasks = defaultdict(list)
-        for task in tasks_good:
-            for i in range(min(len(tasks_good[task]), len(tasks_bad[task]))):
-                self.tasks[task].append(tasks_good[task][i])
-                self.tasks[task].append(tasks_bad[task][i])
+        
+        for task in self.tasks_good:
+            for i in range(min(len(self.tasks_good[task]), len(self.tasks_bad[task]))):
+                self.tasks[task].append(self.tasks_good[task][i])
+                self.tasks[task].append(self.tasks_bad[task][i])
+        
     
     def __iter__(self):
         self.set_tasks()
                     
         self.task_samplers = {}
         for task, idxs in self.tasks.items():
-            self.task_samplers[task] = BatchSampler(idxs, self.task_size, drop_last=True)
+            self.task_samplers[task] = BatchSampler(idxs, self.task_size, drop_last=self.drop_last)
         self.num_tasks = self.num_samples // self.task_size
         task_iters = None
         i=0

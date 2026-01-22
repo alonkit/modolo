@@ -26,10 +26,11 @@ from datasets.process_chem.process_mols import (
     moad_extract_receptor_structure,
     read_molecule,
     get_binding_pockets,
+    get_sub_prot_for_ligs
 )
 from esm import FastaBatchedDataset, pretrained
 
-from datasets.process_chem.process_sidechains import get_core_and_chains, get_holes, get_mask_of_sidechains, get_mol_smiles, set_hole_ids
+from datasets.process_chem.process_sidechains import add_frag_place_holder, get_core_and_chains, get_holes, get_mol_smiles
 from utils.esm_utils import compute_ESM_embeddings
 from utils.logging_utils import get_logger
 from utils.map_file_manager import MapFileManager
@@ -63,6 +64,7 @@ class FsDockDataset(Dataset):
         load_mols=False,
         core_weight=0.5,
         random_max_angle=None,
+        random_translation=None,
     ):
         if isinstance(tasks, str):
             tasks = pd.read_csv(tasks)
@@ -80,17 +82,19 @@ class FsDockDataset(Dataset):
         self.tasks_file = f"tasks_rh{remove_hs}_cw{core_weight}.pt"
         self.ligands_file = f"ligands_cw{core_weight}.pt"
         self.saved_protein_graph_file = f"protein_graphs_rr{receptor_radius}_camn{c_alpha_max_neighbors}_amn{atom_max_neighbors}_kog{knn_only_graph}_aa{all_atoms}_ar{atom_radius}.pt"
-        self.saved_ligand_sub_protein_file = f"sub_protein_ligand_edges_lr{ligand_radius}_la{ligand_radius}_"\
-            f"rr{receptor_radius}_camn{c_alpha_max_neighbors}_amn{atom_max_neighbors}_kog{knn_only_graph}_aa{all_atoms}_ar{atom_radius}_rh{remove_hs}_cw{core_weight}.npz"
+        # self.saved_ligand_sub_protein_file = f"sub_protein_ligand_edges_lr{ligand_radius}_la{ligand_radius}_"\
+        #     f"rr{receptor_radius}_camn{c_alpha_max_neighbors}_amn{atom_max_neighbors}_kog{knn_only_graph}_aa{all_atoms}_ar{atom_radius}_rh{remove_hs}_cw{core_weight}.npz"
         self.tokenizer = tokenizer
         self.tasks = {}
         self.random_max_angle = random_max_angle
+        self.random_translation = random_translation
         self.load_mols = load_mols
         super().__init__(root, transform)
         if not hasattr(self, "protein_graphs"):
             self.load()
         self.task_sizes = {k: len(v["graphs"]) for k, v in self.tasks.items()}
         self._indices = self.get_indices()
+        # self._indices = self.get_indices()[:1000]
     
 
     def random_small_rotation_matrix(self, max_angle):
@@ -100,6 +104,7 @@ class FsDockDataset(Dataset):
         
         # Small angle in [-max_angle, max_angle]
         angle = (torch.rand(1) * 2 - 1) * max_angle
+        # angle = max_angle
 
         K = torch.tensor([
             [0, -axis[2], axis[1]],
@@ -109,6 +114,14 @@ class FsDockDataset(Dataset):
 
         R = torch.eye(3) + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
         return R
+
+    def translate_point_cloud(self, pc, max_translation):
+        direction = torch.rand(3)
+        direction = direction / direction.norm()
+        
+        translation = direction * max_translation
+        pc_translated = pc + translation
+        return pc_translated
 
     def rotate_point_cloud(self, pc, max_angle):
         centroid = pc.mean(dim=0)
@@ -127,28 +140,32 @@ class FsDockDataset(Dataset):
                 split_indexes.append(
                     (task_name, i)
                 )
+        rng = random.Random(42)
+        rng.shuffle(split_indexes)
         return split_indexes
-
+    
     def tokenize_smiles(self, graph):
         if self.tokenizer:
-            #ugly fix:
-            graph.num_sidechains = int(graph['ligand'].x[:,0].sum().item())
-            
-            core_tokens = self.tokenizer.encode(graph.core_smiles).ids
-            sidechain_tokens = self.tokenizer.encode(graph.sidechains_smiles).ids
-            graph.core_tokens = torch.tensor(core_tokens).unsqueeze(0)
-            graph.sidechain_tokens = torch.tensor(sidechain_tokens).unsqueeze(0)
-            sidechains = re.sub('\[[0-9]+\*\]','', graph.sidechains_smiles).split('.')
-            if graph.sidechains_smiles == '':
-                sidechains = [''] * graph.num_sidechains  
-            sidechains = torch.tensor(list(map(lambda sch: self.tokenizer.encode(sch).ids, sidechains)))
-            graph.split_sidechain_tokens = sidechains
-            pass
+            sidechains = torch.tensor(list(map(lambda sch: self.tokenizer.encode(sch).ids, graph['ligand'].frag_smiles)))
+            graph['ligand'].frag_tokens = sidechains
 
-    def connect_ligand_to_protein(self, task_name, idx, data):
+            graph['ligand'].mol_tokens = torch.tensor([self.tokenizer.encode(graph['ligand'].smiles).ids])
+
+
+    def connect_ligand_to_protein(self, task_name, idx, data, use_cache=True):
         task = self.tasks[task_name]
         protein_graph = self.protein_graphs[task["target"]]
-        sub_protein = self.sub_proteins.load(f'{task["name"]}_{idx}')
+        use_cache = False
+        if not hasattr(self,'reported'):
+            print('using cache' if use_cache else 'Warning: not using cache')
+            self.reported = True
+        if use_cache:
+            sub_protein = self.sub_proteins.load(f'{task["name"]}_{idx}')
+        else: 
+
+            sub_protein = get_sub_prot_for_ligs(
+                    protein_graph, [data], self.ligand_radius, self.atom_radius
+                )[0]
         rec_id, lig_rec, rec_rec, atom_id, lig_atom, atom_atom, atom_rec = sub_protein
         data["receptor"].x = protein_graph["receptor"].x[rec_id]
         data["receptor"].pos = protein_graph["receptor"].pos[rec_id]
@@ -174,7 +191,7 @@ class FsDockDataset(Dataset):
             else:
                 if key == "graphs":
                     sub_task[key] = []
-                    for i in idxs:
+                    for i in idxs: 
                         graph = deepcopy(task["graphs"][i])
                         graph.sidechains_mask = torch.from_numpy(graph.sidechains_mask)
                         self.connect_ligand_to_protein(task["name"], i, graph)
@@ -187,19 +204,26 @@ class FsDockDataset(Dataset):
     def __getitem__(self, idx):
         if isinstance(idx, tuple):
             task_name, i = idx
+        elif isinstance(idx,list):
+            items = [self[s_idx] for s_idx in idx]
+            return items
         else:
             task_name, i = self._indices[idx]
         
         graph = deepcopy(self.tasks[task_name]["graphs"][i])
         if self.random_max_angle is not None:
             graph["ligand"].pos = self.rotate_point_cloud(graph["ligand"].pos, self.random_max_angle)
+        if self.random_translation is not None:
+            graph["ligand"].pos = self.translate_point_cloud(graph["ligand"].pos, self.random_translation)
         graph.task = task_name
-        graph.sidechains_mask = torch.from_numpy(graph.sidechains_mask).to(torch.int)
-        graph.hole_neighbors = torch.tensor(graph.hole_neighbors)
+        graph['ligand'].frag_hole = torch.from_numpy(graph['ligand'].frag_hole)
+        graph['ligand'].frag_idxs = torch.from_numpy(graph['ligand'].frag_idxs)
+        graph['ligand'].core_mask = torch.from_numpy(graph['ligand'].core_mask)
         self.connect_ligand_to_protein(self.tasks[task_name]["name"], i, graph)
+        graph = add_frag_place_holder(graph)
         self.tokenize_smiles(graph)
-        graph.num_sidechains = int(graph.num_sidechains)
         return graph
+
 
     def get_task_metadata(self, task_name):
         task = self.tasks[task_name]
@@ -219,7 +243,7 @@ class FsDockDataset(Dataset):
             self.saved_protein_file,
             self.saved_protein_graph_file,
             self.saved_esm_file,
-            self.saved_ligand_sub_protein_file,
+            # self.saved_ligand_sub_protein_file,
             self.tasks_file,
             self.ligands_file,
         ]
@@ -234,11 +258,11 @@ class FsDockDataset(Dataset):
         self.protein_graphs = torch.load(
             osp.join(self.processed_dir, self.saved_protein_graph_file)
         )
-        self.logger.info("started load ligand_protein_edges")
-        sub_proteins_path = osp.join(
-            self.processed_dir, self.saved_ligand_sub_protein_file
-        )
-        self.sub_proteins = MapFileManager(sub_proteins_path, 'r').open()
+        # self.logger.info("started load ligand_protein_edges")
+        # # sub_proteins_path = osp.join(
+        #     self.processed_dir, self.saved_ligand_sub_protein_file
+        # )
+        # self.sub_proteins = MapFileManager(sub_proteins_path, 'r').open()
         self.logger.info("finished load")
 
     def process(self):
@@ -249,7 +273,7 @@ class FsDockDataset(Dataset):
         self.logger.info("started process_proteins")
         self.process_proteins()
         self.logger.info("started process_ligand_protein_edges")
-        self.process_sub_proteins()
+        # self.process_sub_proteins()
         self.logger.info("finished process")
 
     def process_ligands(self):
@@ -275,7 +299,7 @@ class FsDockDataset(Dataset):
                     progress_bar.update()
         self.ligands = ligands
         torch.save(self.ligands, osp.join(self.processed_dir, self.ligands_file))
-
+        
     @staticmethod
     def process_ligand(args):
         res = {}
@@ -287,7 +311,7 @@ class FsDockDataset(Dataset):
             smiles = get_mol_smiles(ligand)
             res['ligand']=ligand
             res['smiles']=smiles
-            core, core_smiles, sidechains, sidechains_smiles, hole_neighbors = get_core_and_chains(
+            core, sidechains, slicing_data = get_core_and_chains(
                 ligand, core_weight
             )
             if core is None:
@@ -296,16 +320,8 @@ class FsDockDataset(Dataset):
                 )
                 return task_name, idx, res
             res['core']=core
-            res['core_smiles']=core_smiles
             res['sidechains']=sidechains
-            res['sidechains_smiles']=sidechains_smiles
-            res['hole_neighbors']=hole_neighbors
-            sidechains_mask = get_mask_of_sidechains(ligand, sidechains)
-            res['num_sidechains']= sidechains_mask.max().item()
-            hole_features = get_holes(ligand)
-            extra_atom_feats = {'__holeIdx': hole_features}
-            res['sidechains_mask']=sidechains_mask
-            res['extra_atom_feats']=extra_atom_feats
+            res.update(slicing_data)
             return (
                 task_name,
                 idx,
@@ -318,110 +334,25 @@ class FsDockDataset(Dataset):
             get_logger().error(traceback.format_exc())
             return task_name, idx, res
 
-    def process_sub_proteins(self):
-        path = osp.join(self.processed_dir, self.saved_ligand_sub_protein_file)
-        if files_exist([path]):
-            self.sub_proteins = MapFileManager(path, 'r').open()
-            return
-        with MapFileManager(path, 'w') as mf:
-            for task_name, task in tqdm(
-                self.tasks.items(), desc="processsing sub proteins"
-            ):
-                protein_graph = self.protein_graphs[task["target"]]
-                ligand_graphs = task["graphs"]
-                task_sub_proteins = self.get_sub_prot_for_ligs(
-                    protein_graph, ligand_graphs, self.ligand_radius, self.atom_radius
-                )
-                for i, sub_prot in enumerate(task_sub_proteins):
-                    mf.save(sub_prot,f'{task_name}_{i}')
-        self.sub_proteins = MapFileManager(path, 'r').open()
+    # def process_sub_proteins(self):
+    #     path = osp.join(self.processed_dir, self.saved_ligand_sub_protein_file)
+    #     if files_exist([path]):
+    #         self.sub_proteins = MapFileManager(path, 'r').open()
+    #         return
+    #     with MapFileManager(path, 'w') as mf:
+    #         for task_name, task in tqdm(
+    #             self.tasks.items(), desc="processsing sub proteins"
+    #         ):
+    #             protein_graph = self.protein_graphs[task["target"]]
+    #             ligand_graphs = task["graphs"]
+    #             task_sub_proteins = self.get_sub_prot_for_ligs(
+    #                 protein_graph, ligand_graphs, self.ligand_radius, self.atom_radius
+    #             )
+    #             for i, sub_prot in enumerate(task_sub_proteins):
+    #                 mf.save(sub_prot,f'{task_name}_{i}')
+    #     self.sub_proteins = MapFileManager(path, 'r').open()
         
-
-    @staticmethod
-    def get_sub_prot_for_ligs(
-        protein_graph, ligand_graphs, rec_cutoff_distance, atom_cutoff_distance=None
-    ):
-        all_atoms = atom_cutoff_distance is not None
-        lig_poses = torch.cat([g["ligand"].pos for g in ligand_graphs], dim=0)
-        lig_slices = torch.tensor([0, *(len(g["ligand"].pos) for g in ligand_graphs)])
-        lig_slices = torch.cumsum(lig_slices, dim=0)
-        lig_rec_batch = radius(
-            protein_graph["receptor"].pos,
-            lig_poses,
-            rec_cutoff_distance,
-            max_num_neighbors=9999,
-        )
-        if all_atoms:
-            lig_atom_batch = radius(
-                protein_graph["atom"].pos,
-                lig_poses,
-                atom_cutoff_distance,
-                max_num_neighbors=9999,
-            )
-        lig_rec = None
-        rec_id = None
-        lig_atom = None
-        atom_id = None
-        rec_rec = None
-        atom_rec = None
-        atom_atom = None
-        sub_proteins = []
-        lig_rec_slices = torch.searchsorted(lig_rec_batch[0], lig_slices)
-        lig_atom_slices = (
-            torch.searchsorted(lig_atom_batch[0], lig_slices) if all_atoms else None
-        )
-        rec_rec_orig = protein_graph["receptor", "receptor"].edge_index
-        rec_rec_orig = rec_rec_orig[
-            :, torch.all(torch.isin(rec_rec_orig, lig_rec_batch[1]), dim=0)
-        ]
-        if all_atoms:
-            atom_atom_orig = protein_graph["atom", "atom"].edge_index
-            atom_atom_orig = atom_atom_orig[
-                :, torch.all(torch.isin(atom_atom_orig, lig_atom_batch[1]), dim=0)
-            ]
-            atom_rec_orig = protein_graph["atom", "receptor"].edge_index
-            atom_rec_orig_e = torch.isin(
-                atom_rec_orig[0], lig_atom_batch[1]
-            ) & torch.isin(atom_rec_orig[1], lig_rec_batch[1])
-            atom_rec_orig = atom_rec_orig[:, atom_rec_orig_e]
-        for i, lig_i_start in enumerate(lig_slices[:-1]):
-            rec_e_start, rec_e_end = lig_rec_slices[i : i + 2]
-            lig_rec = lig_rec_batch[:, rec_e_start:rec_e_end].clone()
-            if lig_rec.numel():
-                lig_rec[0] = lig_rec[0] - lig_i_start
-            if all_atoms:
-                atom_e_start, atom_e_end = lig_atom_slices[i : i + 2]
-                lig_atom = lig_atom_batch[:, atom_e_start:atom_e_end].clone()
-                if lig_atom.numel():
-                    lig_atom[0] = lig_atom[0] - lig_i_start
-            # now we have all the edges to the full protein
-            rec_id = torch.unique(lig_rec[1])
-            if all_atoms:
-                atom_id = torch.unique(lig_atom[1])
-
-            rec_rec = rec_rec_orig[
-                :, torch.all(torch.isin(rec_rec_orig, rec_id), dim=0)
-            ]
-            rec_rec = torch.searchsorted(rec_id, rec_rec)
-            lig_rec[1] = torch.searchsorted(rec_id, lig_rec[1])
-
-            if all_atoms:
-                atom_atom = atom_atom_orig[
-                    :, torch.all(torch.isin(atom_atom_orig, atom_id), dim=0)
-                ]
-                atom_atom = torch.searchsorted(atom_id, atom_atom)
-                lig_atom[1] = torch.searchsorted(atom_id, lig_atom[1])
-
-                relevant_edges = torch.isin(atom_rec_orig[0], atom_id) & torch.isin(
-                    atom_rec_orig[1], rec_id
-                )
-                atom_rec = atom_rec_orig[:, relevant_edges]
-                atom_rec[0] = torch.searchsorted(atom_id, atom_rec[0])
-                atom_rec[1] = torch.searchsorted(rec_id, atom_rec[1])
-            sub_proteins.append(
-                (rec_id, lig_rec, rec_rec, atom_id, lig_atom, atom_atom, atom_rec)
-            )
-        return sub_proteins
+    
 
     def process_tasks(self):
         if files_exist([osp.join(self.processed_dir, self.tasks_file)]):
@@ -456,16 +387,19 @@ class FsDockDataset(Dataset):
             "labels": [],
         }
         for (idx, row), ligand_data in zip(grouped_rows.iterrows(), ligands):
-            if ligand_data.get('sidechains_mask') is None:
+            if "core_mask" not in ligand_data:
                 continue
             ligand_graph = HeteroData()
-            get_lig_graph(ligand_data['ligand'], ligand_graph, self.ligand_radius, ligand_data['extra_atom_feats'])
-            ligand_graph.smiles = ligand_data['smiles']
-            ligand_graph.core_smiles = ligand_data['core_smiles']
-            ligand_graph.sidechains_smiles = ligand_data['sidechains_smiles']
-            ligand_graph.sidechains_mask = ligand_data['sidechains_mask']
-            ligand_graph.hole_neighbors = ligand_data['hole_neighbors']
-            ligand_graph.num_sidechains = ligand_data['num_sidechains']
+            get_lig_graph(ligand_data['ligand'], ligand_graph, self.ligand_radius, {"__holeIdx": ligand_data['hole_count']})
+            ligand_graph['ligand'].smiles = ligand_data['smiles']
+            ligand_graph['ligand'].frag_smiles = ligand_data['frag_smiles']
+            ligand_graph['ligand'].frag_hole = ligand_data['frag_hole']
+            ligand_graph['ligand'].core_smiles = ligand_data['core_smiles']
+            ligand_graph['ligand'].frag_idxs = ligand_data['frag_idxs']
+            ligand_graph['ligand'].core_mask = ligand_data['core_mask']
+            ligand_graph['ligand'].num_frags = ligand_data['num_frags']
+            
+            
             ligand_graph.activity_type = row["type"]
             ligand_graph.label = row["label"]
             task["activity_type"] = row["type"]
@@ -499,10 +433,27 @@ class FsDockDataset(Dataset):
             proteins = torch.load(protein_path)
         return proteins
 
+    @staticmethod
+    def process_protein_graph(args):
+        protein_graph = HeteroData()
+        moad_extract_receptor_structure(
+            pdb=args['protein'],
+            complex_graph=protein_graph,
+            neighbor_cutoff=args['receptor_radius'],
+            max_neighbors=args['c_alpha_max_neighbors'],
+            lm_embeddings=args['lm_embeddings'],
+            knn_only_graph=args['knn_only_graph'],
+            all_atoms=args['all_atoms'],
+            atom_cutoff=args['atom_radius'],
+            atom_max_neighbors=args['atom_max_neighbors'],
+        )
+        return args['protein_id'], protein_graph
+        
     def generate_protein_graphs(self, proteins, lm_embeddings):
         protein_graph_path = osp.join(self.processed_dir, self.saved_protein_graph_file)
         if not files_exist([protein_graph_path]):
             protein_graphs = {}
+         
             for protein_id, protein in tqdm(
                 proteins.items(), desc="Generating protein graphs"
             ):
@@ -556,3 +507,6 @@ class FsDockDataset(Dataset):
         else:
             lm_embeddings = torch.load(esm_path)
         return lm_embeddings
+
+
+
