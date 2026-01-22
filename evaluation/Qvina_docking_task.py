@@ -12,7 +12,6 @@ import multiprocessing
 from proc_run import run_step
 import pandas as pd
 from loguru import logger
-# /home/alon.kitin/docking_cfom/data/proteins/pdbs/Q07869.pdb	/home/alon.kitin/docking_cfom/data/CHEMBL1001152/docks/b1/rank1.sdf
 
 import warnings
 from collections import defaultdict
@@ -312,19 +311,3 @@ class QVinaDockingTask:
             return None
         return self.results[0]['affinity']
     
-if __name__ == '__main__':
-    with open('/home/alon.kitin/vinaTest/data/example/smiles.txt','r') as f:
-        optimized_smiles = [line.strip() for line in f.readlines()]
-    task = QVinaDockingTask(
-        orig_ligand_path = '/home/alon.kitin/crossdocked_test_set/ABL2_HUMAN_274_551_0/4xli_B_rec_4xli_1n1_lig_tt_min_0.sdf',
-        protein_path = '/home/alon.kitin/crossdocked_test_set/ABL2_HUMAN_274_551_0/4xli_B_rec_4xli_1n1_lig_tt_min_0_pocket10.pdb',
-        optimized_smiles=optimized_smiles,
-        tmp_dir = '/home/alon.kitin/vinaTest/data/example/tmp',
-        cpus = 2,
-        silent=True        
-    )
-    QVinaDockingTask.run_many_tasks([task], cpu_per_task=2).to_csv('/home/alon.kitin/vinaTest/data/example/results.csv', index=False)
-    # print(task.run())
-    exit()
-    results = task.run_all()
-    print('Done. Found %d modes' % len(results))
