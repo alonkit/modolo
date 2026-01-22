@@ -1,0 +1,120 @@
+metadata:
+  name: cross_frags
+  devices: auto
+  debug: false
+  batch_size: 80
+logger:
+  _target_: pytorch_lightning.loggers.wandb.WandbLogger
+  project: ${metadata.name}
+  offline: ${metadata.debug}
+tokenizer:
+  _target_: tokenizers.Tokenizer.from_file
+  path: models/configs/smiles_tokenizer.json
+model:
+  _target_: models.vae.modolo.ModoloVae
+  transformer_encoder:
+    _target_: models.transformer.TransformerEncoder
+    tokenizer: ${tokenizer}
+    embedding_dim: 256
+    hidden_size: 128
+    nhead: 4
+    n_layers: 2
+    max_length: 128
+    dropout: 0.3
+  transformer_decoder:
+    _target_: models.vae.decoder.VaeDecoder
+    tokenizer: ${tokenizer}
+    embedding_dim: 256
+    hidden_size: 128
+    nhead: 4
+    n_layers: 2
+    max_length: 128
+    dropout: 0.3
+  interaction_encoder:
+    _target_: models.interaction_encoder.InteractionEncoder
+    output_dim: ${model.transformer_decoder.embedding_dim}
+  graph_encoder:
+    _target_: models.graph_encoder.GraphEncoder
+    in_channels: 96
+    edge_channels: 96
+    hidden_channels:
+    - 96
+    - 128
+    - 128
+    out_channels: ${model.transformer_decoder.embedding_dim}
+    attention_groups:
+    - 12
+    - 16
+    - 16
+    - 32
+    version: 3
+    dropout: 0.3
+    max_length: 128
+    distance_scaling: false
+    graph_embedder:
+      _target_: models.vae.graph_embedder.GraphEmbedder
+      distance_embed_dim: 16
+      cross_distance_embed_dim: 16
+      lig_max_radius: 4
+      rec_max_radius: 10
+      cross_max_distance: 10
+      lig_feature_dims:
+        _target_: datasets.process_chem.features.get_lig_feature_dims
+      lig_edge_feature_dim: 4
+      lig_emb_dim: ${model.graph_encoder.in_channels}
+      rec_feature_dims:
+        _target_: datasets.process_chem.features.get_rec_residue_feature_dims
+      atom_feature_dims:
+        _target_: datasets.process_chem.features.get_rec_atom_feature_dims
+      prot_emd_dim: ${model.graph_encoder.in_channels}
+      dropout: 0.3
+      ligand_dropout: 0.5
+      lm_embedding_dim: 1280
+lightning:
+  _target_: models.vae.modolo_lightning.ModoloLightningVae
+  lr: 0.0001
+  weight_decay: 0.0001
+  num_gen_samples: 20
+  handle_inactive: flag
+  tokenizer: ${tokenizer}
+train:
+  batch_size: ${metadata.batch_size}
+  trainer:
+    _target_: pytorch_lightning.Trainer
+    devices: ${metadata.devices}
+    num_sanity_val_steps: 1
+    max_epochs: 40
+    gradient_clip_val: 1.0
+    val_check_interval: 0.2
+  val_dataset:
+    _target_: datasets.fsmol_dock.FsDockDataset
+    root: data/cross/valid
+    tasks: data/cross/valid_tasks.csv
+    core_weight: 0.7
+    ligand_radius: 10
+  corrupt_val_dataset:
+    _target_: datasets.fsmol_dock.FsDockDataset
+    root: data/cross/valid
+    tasks: data/cross/valid_tasks.csv
+    random_translation: 4.0
+    random_max_angle: 3.14
+    core_weight: 0.7
+    ligand_radius: 10
+  train_dataset:
+    _target_: datasets.cross_partitioned.CrossPartitionedFsDockDataset
+    root: data/cross/train
+    tasks: data/cross/train_tasks.csv
+    core_weight: 0.7
+    ligand_radius: ${train.val_dataset.ligand_radius}
+  sampler:
+    _target_: datasets.custom_distributed_sampler.CustomDistributedSampler
+    shuffle: true
+test:
+  dataset:
+    _target_: datasets.fsmol_dock.FsDockDataset
+    root: data/cross/test
+    tasks: data/cross/test_tasks.csv
+    core_weight: 0.7
+    ligand_radius: ${train.val_dataset.ligand_radius}
+    random_translation: 8.0
+    random_max_angle: 3.14

@@ -43,6 +43,8 @@ def tree_frags_from_mol(mol, weight_ratio=0.5):
     # fragmenter = sg.core.MurckoRingFragmenter(use_scheme_4=True)
     fragmenter = sg.core.MurckoRingSystemFragmenter()
     minimal_core_weight = AllChem.CalcExactMolWt(mol) * weight_ratio 
+    # if AllChem.CalcExactMolWt(scaffold.mol) <= minimal_core_weight:
+    #     return mol
     rules = sg.prioritization.original_ruleset
     original_rings_count = scaffold.rings.count
 
@@ -76,7 +78,7 @@ def get_mol_smiles(mol):
     return Chem.MolToSmiles(mol)
 
 def get_core_and_chains(m1,core_weight):
-    error = [None] * 5
+    error = [None] * 3
     if  isinstance(m1,str):
         m1 = Chem.MolFromSmiles(m1)
     if m1 is None:
@@ -87,38 +89,148 @@ def get_core_and_chains(m1,core_weight):
     clean_core = tree_frags_from_mol(m1,core_weight)
     if clean_core is None:
         return error
-    core = Chem.ReplaceSidechains(m1, clean_core)
-    sidechains = Chem.ReplaceCore(m1, clean_core)
-    if core is None or sidechains is None:
+    
+    core, sidechains = _get_core_and_chains(m1, clean_core)
+    # core = Chem.ReplaceSidechains(m1, clean_core)
+    # sidechains = Chem.ReplaceCore(m1, clean_core)
+    # sidechains = [] if sidechains is None else list(Chem.GetMolFrags(sidechains, asMols=True))
+    if core is None or len(sidechains)==0:
         return error
-    core_smiles = Chem.MolToSmiles(core)
-    sidechains_smiles = Chem.MolToSmiles(sidechains)
-    if core_smiles == '' or sidechains_smiles == '':
-        return error
-    hole_neighbors = set_hole_ids(m1, core)
-    return clean_core, core_smiles, sidechains ,sidechains_smiles, hole_neighbors
+    return clean_core, sidechains , get_slicing_data(m1,clean_core, core, sidechains)
 
-def get_mask_of_sidechains(full_mol,sidechains):
-    frags = Chem.GetMolFrags(sidechains, asMols=True)
-    mask = np.zeros(full_mol.GetNumAtoms())
+def _get_core_and_chains(mol, clean_core):
+    core_idxs = set()
+    for atom in clean_core.GetAtoms():
+        if atom.HasProp("__origIdx"):
+            core_idxs.add(atom.GetIntProp("__origIdx"))
+    if not core_idxs:
+        raise ValueError("Core atoms do not have __origIdx property")
+    if len(core_idxs) == mol.GetNumAtoms():
+        return mol, []
+
+    bonds_to_break = []
+    dummy_labels = [] # List of (label_for_u_side, label_for_v_side)
+    for bond in mol.GetBonds():
+        u = bond.GetBeginAtom()
+        v = bond.GetEndAtom()
+        u_idx = u.GetIntProp("__origIdx")
+        v_idx = v.GetIntProp("__origIdx")
+        u_is_core = u_idx in core_idxs
+        v_is_core = v_idx in core_idxs
+        
+        # We only care if one is core and the other is NOT core (XOR)
+        if u_is_core ^ v_is_core:
+            bonds_to_break.append(bond.GetIdx())
+            dummy_labels.append((len(bonds_to_break), len(bonds_to_break)))
+            
+    # 3. Perform the fragmentation
+    # This returns a single molecule with broken bonds and dummy atoms added
+    fragmented_mol = Chem.FragmentOnBonds(
+        mol, 
+        bonds_to_break, 
+        dummyLabels=dummy_labels
+    )
+    
+    # 4. Separate fragments
+    frags = Chem.GetMolFrags(fragmented_mol, asMols=True)
+    
+    sidechains = []
+    core = None
+    seen_idxs = set()
+    for frag in frags:
+        # We need to distinguish the "Core Fragment" from "Sidechain Fragments".
+        # A simple heuristic: Check if the atoms in this fragment are effectively the core atoms.
+        # However, since we added dummy atoms, we check if ANY non-dummy atom in this fragment
+        # is NOT in the core_idxs set.
+        
+        idxs = set(a.GetIntProp("__origIdx") for a in frag.GetAtoms() if a.HasProp("__origIdx"))
+        assert len(seen_idxs.intersection(idxs)) == 0, "Fragments should be disjoint"
+        seen_idxs.update(idxs)
+        
+        if all(idx in core_idxs for idx in idxs):
+            # All atoms in this fragment are from the core
+            core = frag
+            continue    
+        
+        elif all(idx not in core_idxs for idx in idxs):
+            sidechains.append(frag)
+        else:
+            # This fragment has a mix of core and sidechain atoms, which should not happen
+            raise ValueError("Fragment contains a mix of core and sidechain atoms.")
+    
+    assert len(seen_idxs) == mol.GetNumAtoms(), "Some atoms were not assigned to core or sidechains"
+    
+    #  sidechains might not be sorted by the order i predicted, SO STUPIDDDDD of me aaaaaaaaa
+    sidechains.sort(key=lambda s: int(re.search(r'\[(\d+)', Chem.MolToSmiles(s)).group(1)))
+    
+    return core, sidechains
+
+# def get_mask_of_sidechains(full_mol,frags):
+#     mask = np.zeros(full_mol.GetNumAtoms())
+#     for i, frag in enumerate(frags):
+#         frag_indices = [a.GetIntProp("__origIdx") for a in frag.GetAtoms() if a.HasProp("__origIdx")]
+#         mask[frag_indices] = i + 1            
+#     return mask
+
+def get_slicing_data(mol, clean_core, core, frags):
+    core_mask = np.zeros(mol.GetNumAtoms(), dtype=bool)
+    core_mask[[a.GetIntProp("__origIdx") for a in clean_core.GetAtoms() if a.HasProp("__origIdx")]] = True
+    
+    hole_count = np.zeros(mol.GetNumAtoms(),dtype=int)
+    frag_idxs = np.zeros(mol.GetNumAtoms(),dtype=int) - 1
+    frag_hole = np.zeros(len(frags),dtype=int)
     for i, frag in enumerate(frags):
-        frag_indices = [a.GetIntProp("__origIdx") for a in frag.GetAtoms() if a.HasProp("__origIdx")]
-        mask[frag_indices] = i + 1            
-    return mask
+        frag_idxs[[a.GetIntProp("__origIdx") for a in frag.GetAtoms() if a.HasProp("__origIdx")]] = i
+    assert frag_idxs[core_mask].max() == -1 , "Core atoms should not have fragment indices"
+    for a in mol.GetAtoms():
+        a_id = a.GetIntProp("__origIdx")
+        if not core_mask[a_id]: # already in side chain
+            continue
+        for neighbor in a.GetNeighbors(): 
+            n_id = neighbor.GetIntProp("__origIdx")
+            if not core_mask[n_id]: # "a" not in sidechain, "n" is, Good
+                n_frag_id = frag_idxs[n_id]
+                frag_hole[n_frag_id] = a_id
+                hole_count[a_id] += 1
+    return  dict(
+        core_mask=core_mask,
+        hole_count=hole_count,
+        frag_idxs=frag_idxs,
+        frag_hole = frag_hole,
+        num_frags=len(frags),
+        core_smiles=Chem.MolToSmiles(core),
+        frag_smiles = list(map(lambda f: Chem.MolToSmiles(f).split(']',1)[1], frags))
+    )
+    
+def get_fake_slicing_data(extended_mol, mol):
+    core_mask = np.zeros(mol.GetNumAtoms(), dtype=bool)
+    core_mask[:] = True
+    hole_count = np.zeros(mol.GetNumAtoms(),dtype=int)
+    frag_idxs = np.zeros(mol.GetNumAtoms(),dtype=int) - 1
+    
+    fake_atoms = [a for a in extended_mol.GetAtoms() if not  a.HasProp("__origIdx")]
+    
+    frag_hole = np.zeros(len(fake_atoms),dtype=int)
 
-def set_hole_ids(mol, core):
-    near_holes = []
-    hole_usage_counter = defaultdict(int)
-    for atom in core.GetAtoms():
-        if atom.GetSymbol() == '*':
-            iso = atom.GetIsotope()
-            for neighbor in atom.GetNeighbors():
-                n_id = neighbor.GetIntProp("__origIdx")
-                near_holes.append(n_id)
-                hole_usage_counter[n_id] += 1
-                mol.GetAtomWithIdx(n_id).SetIntProp("__holeIdx", hole_usage_counter[n_id])
-    return near_holes
+    for i, a in enumerate(fake_atoms):
+        for neighbor in a.GetNeighbors(): 
+            n_id = neighbor.GetIntProp("__origIdx")
+            frag_hole[i] = n_id
+            hole_count[n_id] += 1
 
+    return  dict(
+        core_mask=core_mask,
+        hole_count=hole_count,
+        frag_idxs=frag_idxs,
+        frag_hole = frag_hole,
+        num_frags=len(fake_atoms),
+        core_smiles=Chem.MolToSmiles(extended_mol),
+        frag_smiles = ['']* len(fake_atoms)
+    )
+    
+    
+    
+   
 def get_holes(mol):
     hole_lst = np.zeros(mol.GetNumAtoms())
     for i, atom in enumerate(mol.GetAtoms()):
@@ -138,6 +250,8 @@ def smiles_valid(smiles,verbose=False):
 def get_fp(mol):
     if isinstance(mol, str):
         mol = Chem.MolFromSmiles(mol)
+        if mol is None:
+            return
     fp_obj = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048,
                                                    useChirality=False)
     fp = np.zeros((0,), dtype=np.int8)
@@ -203,8 +317,6 @@ def isotopize_dummies(fragment, isotope):
 
 
 def add_attachment_points(mol, n, seed=None, fg_weight=0, fg_list=[]):
-    if isinstance(mol, str):
-        mol = Chem.MolFromSmiles(mol)
     if mol is None:
         return None
     if seed is not None:
@@ -220,6 +332,8 @@ def add_attachment_points(mol, n, seed=None, fg_weight=0, fg_list=[]):
                            [x[0] for x in fg_list] + ["[c,C][H]"],
                            [x[1] for x in fg_list] + ["C*"]))
 
+    for a in mol.GetAtoms():
+        a.SetIntProp("__origIdx", a.GetIdx())
     current_attachment_index = 1
     current_mol = mol
     for i in range(n):
@@ -256,18 +370,38 @@ def add_attachment_points(mol, n, seed=None, fg_weight=0, fg_list=[]):
                 new_atom = atom
         new_atom.SetIntProp("__origIdx", idxs.pop())
 
-    hole_neighbors = set_hole_ids(mol, current_mol)
-    current_smiles = Chem.MolToSmiles(current_mol)
-    return current_smiles, hole_neighbors
+    return mol, [], get_fake_slicing_data(current_mol, mol)
 
 
-if __name__ == '__main__':
-    # ligand = Chem.MolFromSmiles("c1cc2c(cc1[C@H]1OC[C@H]3[C@@H](c4ccc5c(c4)OCO5)OC[C@@H]13)OCO2")
-    # core, core_smiles, sidechains ,sidechains_smiles, hole_neighbors = get_core_and_chains(ligand)
-    # # core_indices = get_mask_of_sidechains(ligand,core)
-    # # sidechain_indices = get_mask_of_sidechains(ligand,sidechains)
-    # print(add_attachment_points(ligand, 2))
-    # print(get_holes(ligand))
-
-    reconstruct_from_core_and_chains('[1*]c1cccc2n1cc(-c1ccc([2*])cc1)[n+]2[3*]',
-                                     '[1*]NC(C)=N(C)C.[2*]O.[3*]CC(=O)C')
+def add_frag_place_holder(graph):
+    graph = graph.clone()
+    frag_idxs = graph['ligand'].frag_idxs
+    # centers = []
+    # for i in range(graph['ligand'].frag_hole.shape[0]):
+    #     mask = frag_idxs == i
+    #     if mask.sum() == 0:
+    #         continue
+    #     center = graph['ligand'].pos[mask].mean(0, keepdim=True)
+    #     centers.append(center)
+    # graph['frag'].pos = torch.cat(centers, dim=0)
+    graph['frag'].pos = graph['ligand'].pos[graph['ligand'].frag_hole]
+    
+    graph['frag'].x = torch.zeros(graph['frag'].pos.shape[0],1)
+    graph['ligand','frag'].edge_index = torch.cat([graph['ligand'].frag_hole.unsqueeze(0), torch.arange(graph['ligand'].frag_hole.shape[0]).unsqueeze(0)], dim=0)
+    #  edges
+    for dst in ['atom', 'receptor']:
+        edges = []
+        for i in range(graph['ligand'].frag_hole.shape[0]):
+            curr_frag_nodes = graph['ligand'].frag_idxs == i
+            fe = graph['ligand',dst].edge_index
+            fe = fe[:, curr_frag_nodes[fe[0]]]
+            fe[0] = i
+            edges.append(fe)
+        if len(edges)>0:
+            graph['frag', dst].edge_index = torch.cat(edges, dim=1)
+            
+            
+    return graph
+    
+        
+    
